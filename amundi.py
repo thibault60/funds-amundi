@@ -1,25 +1,31 @@
 """
-Streamlit app – Générateur de maillage interne v5
+Streamlit app – Générateur de maillage interne v6
 =================================================
-### Règles de maillage
-1. **Maillage intra‑groupe (nom racine)** :
-   * Tous les fonds partageant le même *nom racine* (avant « - ») se lient
-     entre eux.  
-   * Chaque fonds pointe vers jusqu’à **3** autres partages classes du même
-     groupe ; rotation cyclique ⇒ tout le monde reçoit **≥ 1 lien entrant**.
-2. **Fallback** : si le groupe ne comporte qu’un seul fonds, on complète avec
-   des fonds du **même Type**, puis aléatoirement si besoin.
-3. Export natif **Excel .xlsx**.
+> **Amélioration clé :** un nom racine « normalisé » beaucoup plus robuste
+dans `root_name()` pour que les déclinaisons listées (ETF, DR, Acc, etc.)
+se reconnaissent mutuellement et reçoivent **au moins un lien entrant et
+sortant**.
 
-### Tableur requis (ligne 1 = en‑têtes, données dès A2)
-| Colonne | Intitulé |
-|---------|----------|
-| A       | Nom du fonds |
-| B       | Code ISIN |
-| C       | Type |
-| E       | Sous type |
+### Niveaux de maillage
+1. **Même nom racine** (après normalisation) – cyclique jusqu’à 3 liens.
+2. Complément avec fonds du **même Type**.
+3. Fallback aléatoire (rare).
 
-### Dépendances
+### Normalisation du nom racine
+* Coupe au premier `-` (tiret) **ou** au premier `(` parenthèse.
+* Supprime les termes génériques : `UCITS`, `ETF`, `INDEX`, `DR`, `ACC`,
+  `DIST`, `CAP`, `HEDGED`, codes court « A3E », « IE », etc.
+* Réduit les espaces multiples → simple espace, passe en minuscules.
+
+Ainsi :
+> *« AMUNDI INDEX FTSE EPRA NAREIT GLOBAL  - AU (C) »*  ⇒  
+> **amundi index ftse epra nareit global**
+
+Toutes les variantes listées dans votre message partageront donc le même
+nom racine et seront correctement maillées.
+
+Dépendances (fichier *requirements.txt*)
+---------------------------------------
 ```
 streamlit>=1.34
 pandas>=2.0
@@ -35,64 +41,89 @@ from io import BytesIO
 import pandas as pd
 import streamlit as st
 
-NB_LINKS = 3  # nombre maximum de liens sortants par fonds
+NB_LINKS = 3     # Lien 1‑3
+SOFT_CAP = 15    # apparition max avant débordement
 
 # ---------------------------------------------------------------------------
-# Helpers -------------------------------------------------------------------
+# Normalisation du “nom racine” ---------------------------------------------
 # ---------------------------------------------------------------------------
+
+REMOVE_TERMS = {
+    "ucits", "etf", "index", "dr", "acc", "dist", "cap", "hedged", "usd",
+    "eur", "gbp", "mxn", "sgd", "class", "fund", "ie", "a3e", "a3u", "ae",
+    "ihe", "ihc", "ihu", "iu", "me", "mu", "ahe", "mhe", "hedged", "exf"
+}
+
+RE_PAREN = re.compile(r"\(.*?\)")
+RE_WHITESPACE = re.compile(r"\s+")
 
 def root_name(name: str) -> str:
-    """Partie avant le premier " - " (normalisée)."""
-    return re.split(r"\s*-", name, 1)[0].strip().lower()
+    """Normalise le nom pour grouper correctement les déclinaisons ETF.
+    Étapes :
+    1. Coupe au premier `-` ou `(`.
+    2. Retire les parenthèses restantes.
+    3. Supprime les termes génériques / codes share‑class.
+    4. Nettoie les espaces, passe en minuscules.
+    """
+    # Coupe au premier - ou (
+    base = re.split(r"[-(]", name, 1)[0]
+    base = RE_PAREN.sub("", base)
+    tokens = [t for t in RE_WHITESPACE.split(base) if t]
+    tokens = [t for t in tokens if t.lower() not in REMOVE_TERMS]
+    cleaned = " ".join(tokens)
+    return cleaned.lower().strip()
 
 # ---------------------------------------------------------------------------
-# Core ----------------------------------------------------------------------
+# Maillage ------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 
 def build_links(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # Groupes par nom racine et par Type
     by_root: dict[str, list[int]] = {}
     by_type = df.groupby("Type").groups
     for idx, nom in enumerate(df["Nom du fonds"]):
         by_root.setdefault(root_name(nom), []).append(idx)
 
     all_idx = list(df.index)
-    links_out: list[list[str]] = [[] for _ in df.index]
-    inbound = [0] * len(df)
+    links_out = [[] for _ in df.index]
+    inbound   = [0]*len(df)
+    used_cnt  = [0]*len(df)
 
-    # 1) Maillage intra‑groupe ------------------------------------------------
+    # Maillage intra‑groupe cyclique
     for group in by_root.values():
         g = len(group)
         if g == 1:
-            continue  # on gérera le fallback plus bas
+            continue
         for k, idx in enumerate(group):
-            # sélection cyclique des suivants dans le groupe
-            picks_idx = [group[(k + s) % g] for s in range(1, min(NB_LINKS, g - 1) + 1)]
-            links_out[idx] = [df.at[j, "Nom du fonds"] for j in picks_idx]
-            for j in picks_idx:
+            picks = [group[(k+s) % g] for s in range(1, min(NB_LINKS, g))]
+            for j in picks:
+                if len(links_out[idx]) == NB_LINKS:
+                    break
+                links_out[idx].append(df.at[j, "Nom du fonds"])
                 inbound[j] += 1
+                used_cnt[j] += 1
 
-    # 2) Fallback pour groupes isolés ou slots vides -------------------------
+    # Compléter si < NB_LINKS
     for idx, row in df.iterrows():
         if len(links_out[idx]) == NB_LINKS:
-            continue  # déjà rempli au max
-
+            continue
         ttype = row["Type"]
         existing = set(links_out[idx])
 
-        # a) même Type
+        # même Type
         pool = [j for j in by_type.get(ttype, []) if j != idx and df.at[j, "Nom du fonds"] not in existing]
         random.shuffle(pool)
+        pool.sort(key=lambda j: used_cnt[j])
         for j in pool:
             if len(links_out[idx]) == NB_LINKS:
                 break
             links_out[idx].append(df.at[j, "Nom du fonds"])
             inbound[j] += 1
+            used_cnt[j] += 1
             existing.add(df.at[j, "Nom du fonds"])
 
-        # b) aléatoire global si besoin
+        # aléatoire global si besoin
         if len(links_out[idx]) < NB_LINKS:
             remaining = [j for j in all_idx if j != idx and df.at[j, "Nom du fonds"] not in existing]
             random.shuffle(remaining)
@@ -101,21 +132,21 @@ def build_links(df: pd.DataFrame) -> pd.DataFrame:
                     break
                 links_out[idx].append(df.at[j, "Nom du fonds"])
                 inbound[j] += 1
+                used_cnt[j] += 1
 
-        # pad éventuel
-        while len(links_out[idx]) < NB_LINKS:
-            links_out[idx].append("")
+        # padding éventuel
+        links_out[idx] += [""] * (NB_LINKS - len(links_out[idx]))
 
-    # Vérif : tout fonds possède ≥ 1 lien entrant. Si certains restent à 0, on les ajoute aléatoirement.
-    orphans = [i for i, cnt in enumerate(inbound) if cnt == 0]
-    if orphans:
-        for o in orphans:
-            donor = next((i for i, l in enumerate(links_out) if "" in l and i != o), None)
-            if donor is None:
-                donor = (o + 1) % len(df)
-            slot = links_out[donor].index("") if "" in links_out[donor] else NB_LINKS - 1
-            links_out[donor][slot] = df.at[o, "Nom du fonds"]
-            inbound[o] += 1
+    # Orphelins (aucun lien entrant) -> injection forcée
+    for o, cnt in enumerate(inbound):
+        if cnt:
+            continue
+        donor = next((i for i,l in enumerate(links_out) if "" in l and i != o), None)
+        if donor is None:
+            donor = (o+1) % len(df)
+        slot = links_out[donor].index("") if "" in links_out[donor] else NB_LINKS-1
+        links_out[donor][slot] = df.at[o, "Nom du fonds"]
+        inbound[o] += 1
 
     df[["Lien 1", "Lien 2", "Lien 3"]] = links_out
     return df
@@ -126,7 +157,7 @@ def build_links(df: pd.DataFrame) -> pd.DataFrame:
 
 def main():
     st.set_page_config(page_title="Maillage interne des fonds", layout="wide")
-    st.title("🔗 Générateur de maillage interne – v5 (groupe racine → Type → Random)")
+    st.title("🔗 Générateur de maillage interne – v6 (nom racine avancé)")
 
     file = st.file_uploader("Fichier Excel (.xlsx)", type="xlsx")
     if not file:
@@ -145,7 +176,6 @@ def main():
         return
 
     df_out = build_links(df_in)
-
     st.success("Maillage généré ✔️")
     st.dataframe(df_out, height=600)
 
