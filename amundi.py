@@ -1,137 +1,154 @@
 """
-Streamlit app – Générateur de maillage interne (v2)
---------------------------------------------------
-Priorité des liens sortants (colonnes « Lien 1‑3 ») :
-1. **Même Sous type**
-2. **Même Type**
-3. **Aléatoire** parmi le reste si nécessaire
+Streamlit app – Générateur de maillage interne v3
+================================================
+* Assure **≥ 1 lien entrant et sortant** pour chaque fonds.
+* Priorité des suggestions : **Sous-type → Type → Aléatoire**.
+* **Variation** : la liste des candidats est systématiquement mélangée;
+  un compteur d’utilisation limite les répétitions (soft-cap).
+* Export natif **Excel (.xlsx)** via `st.download_button`.
 
-✓ Garantit qu’un fonds possède toujours **au moins un lien sortant**
-✓ Les orphelins (aucun lien entrant) sont rarissimes grâce au fallback aléatoire ;
-  si vous préférez un contrôle strict, activez _ensure_one_inbound_ (voir code).
+Tableur attendu
+---------------
+| Colonne | Étiquette (ligne 1) |
+|---------|---------------------|
+| A       | Nom du fonds        |
+| B       | Code ISIN           |
+| C       | Type                |
+| E       | Sous type           |
 
-Structure Excel attendue
------------------------
-| Colonne | Intitulé (ligne 1) |
-|---------|--------------------|
-| A       | Nom du fonds       |
-| B       | Code ISIN          |
-| C       | Type               |
-| E       | Sous type          |
+Données à partir de **A2**.
 
-Données à partir de **A2**. Extension : .xlsx (moteur *openpyxl*).
-
-requirements.txt
-----------------
+Dependencies
+------------
 ```
 streamlit>=1.34
-pandas
+pandas>=2.0
 openpyxl
 ```
 """
+from __future__ import annotations
+
 import random
+from io import BytesIO
+
 import streamlit as st
 import pandas as pd
 
-NB_LINKS = 3  # Lien 1‑3
+NB_LINKS = 3                # Lien 1-3 par fiche
+MAX_OCCURRENCE = 10         # plafond mou : nb max d'apparitions d'un fonds comme lien
 
-# ----------------------------------------------------------------------------
-# FONCTION DE MAILLAGE -------------------------------------------------------
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Maillage ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-def build_links(df: pd.DataFrame, ensure_one_inbound: bool = False) -> pd.DataFrame:
-    """Retourne un DataFrame enrichi de trois colonnes « Lien 1‑3 ».
-
-    Priorité : Sous type → Type → Random.  
-    `ensure_one_inbound` (False par défaut) : si True, garantit au
-    moins 1 lien entrant par fonds via un post‑traitement (légère
-    complexité supplémentaire).
+def build_links(df: pd.DataFrame) -> pd.DataFrame:
+    """Construit trois colonnes de liens sortants en priorisant :
+    Sous-type ▸ Type ▸ Aléatoire ; garantit ≥ 1 lien entrant par fonds et
+    limite doucement les répétitions grâce à *MAX_OCCURRENCE*.
     """
     df = df.copy()
 
-    # Index pour accès rapide
     by_sous = df.groupby("Sous type").groups
     by_type = df.groupby("Type").groups
     all_idx = list(df.index)
 
-    links_out = []          # pour chaque ligne : [l1,l2,l3]
-    inbound    = [0]*len(df)  # compteurs entrants (optionnel)
+    links_out: list[list[str]] = []       # par ligne
+    inbound  = [0] * len(df)              # liens entrants
+    used_cnt = [0] * len(df)              # nombre de fois utilisé comme suggestion
 
     for idx, row in df.iterrows():
-        stype = row["Sous type"]
-        ttype = row["Type"]
+        stype, ttype = row["Sous type"], row["Type"]
 
-        # 1. mêmes Sous‑type (hors ligne courante)
-        pool = [j for j in by_sous.get(stype, []) if j != idx]
-
-        # 2. mêmes Type, hors doublons
+        pool  = [j for j in by_sous.get(stype, []) if j != idx]
         pool += [j for j in by_type.get(ttype, []) if j != idx and j not in pool]
+        pool += [j for j in all_idx if j != idx and j not in pool]
 
-        # 3. aléatoire si < NB_LINKS
-        if len(pool) < NB_LINKS:
-            remaining = [j for j in all_idx if j != idx and j not in pool]
-            random.shuffle(remaining)
-            pool += remaining
+        # Mélange pour la variation :
+        random.shuffle(pool)
+        # Bias : trier par nombre d'usages (asc.) pour limiter répétitions :
+        pool.sort(key=lambda j: used_cnt[j])
 
-        selected = pool[:NB_LINKS]
-        line_links = [df.at[j, "Nom du fonds"] for j in selected]
-        links_out.append(line_links)
+        selected = []
+        for j in pool:
+            if len(selected) >= NB_LINKS:
+                break
+            if used_cnt[j] < MAX_OCCURRENCE:   # soft-cap
+                selected.append(j)
+                used_cnt[j] += 1
 
-        # inbound count si on veut la contrainte stricte
+        # Pad si manque de candidats :
+        while len(selected) < NB_LINKS:
+            selected.append(None)
+
+        links_out.append([
+            df.at[j, "Nom du fonds"] if j is not None else "" for j in selected
+        ])
         for j in selected:
-            inbound[j] += 1
+            if j is not None:
+                inbound[j] += 1
 
-    # Post‑traitement inbound optionnel
-    if ensure_one_inbound:
-        for i, cnt in enumerate(inbound):
-            if cnt == 0:
-                donor = next((d for d,l in enumerate(links_out)
-                               if i != d and df.at[i,"Nom du fonds"] not in l), None)
-                if donor is not None:
-                    links_out[donor][-1] = df.at[i, "Nom du fonds"]
+    # Seconde passe : tout fonds sans lien entrant en reçoit un
+    for orphan_idx, cnt in enumerate(inbound):
+        if cnt:
+            continue
+        # Cherche une ligne avec slot vide
+        donor = next((i for i, l in enumerate(links_out) if "" in l and i != orphan_idx), None)
+        if donor is None:
+            donor = (orphan_idx + 1) % len(df)  # fallback circulaire
+        empty_pos = links_out[donor].index("")
+        links_out[donor][empty_pos] = df.at[orphan_idx, "Nom du fonds"]
+        inbound[orphan_idx] += 1
 
     df[["Lien 1", "Lien 2", "Lien 3"]] = links_out
     return df
 
-# ----------------------------------------------------------------------------
-# INTERFACE STREAMLIT --------------------------------------------------------
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Interface Streamlit --------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def main():
     st.set_page_config(page_title="Maillage interne des fonds", layout="wide")
-    st.title("📈 Générateur de maillage interne – Priorité Sous‑type > Type > Aléatoire")
+    st.title("🔗 Générateur de maillage interne – v3 (Sous-type ▸ Type ▸ Random)")
 
-    st.markdown(
-        """Chargez un fichier **Excel (.xlsx)** avec les colonnes :
-        **Nom du fonds**, **Code ISIN**, **Type**, **Sous type** (ligne 1)."""
-    )
+    st.markdown("""
+    **Étapes :**
+    1. Déposez un fichier **Excel (.xlsx)** comportant les colonnes obligatoires ;
+    2. Cliquez sur *Télécharger* pour récupérer le fichier enrichi (Lien 1-3).
+    """)
 
-    file = st.file_uploader("Déposez le fichier Excel", type="xlsx")
-    ensure_inb = st.checkbox("Garantir ≥ 1 lien entrant par fonds", value=False)
-
-    if not file:
-        st.info("En attente d'un fichier …")
+    file = st.file_uploader("Fichier Excel (.xlsx)", type="xlsx")
+    if file is None:
+        st.info("En attente d'un fichier …")
         return
 
     try:
         df_in = pd.read_excel(file, engine="openpyxl")
     except Exception as e:
-        st.error(f"Erreur lecture Excel : {e}")
+        st.error(f"Erreur de lecture : {e}")
         return
 
     required = {"Nom du fonds", "Code ISIN", "Type", "Sous type"}
-    miss = required - set(df_in.columns)
-    if miss:
-        st.error("Colonnes manquantes : " + ", ".join(miss))
+    if missing := required - set(df_in.columns):
+        st.error("Colonnes manquantes : " + ", ".join(missing))
         return
 
-    df_out = build_links(df_in, ensure_one_inbound=ensure_inb)
+    df_out = build_links(df_in)
 
-    st.success("Maillage généré ✔️")
+    st.success("Maillage généré ✔️")
     st.dataframe(df_out, height=600)
 
-    csv = df_out.to_csv(index=False).encode("utf-8")
-    st.download_button("📥 Télécharger le CSV enrichi", csv, "fonds_mailles.csv", "text/csv")
+    # Export Excel -----------------------------------------------------------
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df_out.to_excel(writer, index=False, sheet_name="Fonds")
+    buffer.seek(0)
+
+    st.download_button(
+        label="📥 Télécharger l’Excel enrichi",
+        data=buffer,
+        file_name="fonds_mailles.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 if __name__ == "__main__":
     main()
